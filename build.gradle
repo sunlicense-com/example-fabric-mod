@@ -1,0 +1,49 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// The official SunLicense Java SDK (MIT, no dependencies), nested inside the mod jar:
+	// https://github.com/sunlicense-com/sunlicense-java
+	implementation "com.sunlicense:sunlicense:0.0.1"
+	include "com.sunlicense:sunlicense:0.0.1"
+
+	testImplementation platform("org.junit:junit-bom:5.13.4")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+processResources {
+	// SunLicense settings from gradle.properties, -P flags or ORG_GRADLE_PROJECT_* environment variables.
+	def values = [
+		version            : project.version.toString(),
+		sunlicenseUrl      : (project.findProperty("sunlicenseUrl") ?: "https://api.sunlicense.com").toString(),
+		sunlicenseApiKey   : (project.findProperty("sunlicenseApiKey") ?: "").toString(),
+		sunlicensePublicKey: (project.findProperty("sunlicensePublicKey") ?: "").toString(),
+	]
+	inputs.properties(values)
+	filesMatching(["fabric.mod.json", "sunlicense.properties"]) {
+		expand(values)
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+test {
+	useJUnitPlatform()
+}
