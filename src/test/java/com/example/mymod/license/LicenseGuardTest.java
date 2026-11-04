@@ -1,6 +1,7 @@
 package com.example.mymod.license;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -76,9 +77,13 @@ class LicenseGuardTest {
 
     /** An offline file signed like SunLicense signs them: base64url(payload) "." base64url(Ed25519). */
     void offlineFile(String licenseKey, String expiresAt, String refreshAfter, KeyPair signer) throws Exception {
+        offlineFile(licenseKey, expiresAt, refreshAfter, signer, null);
+    }
+
+    void offlineFile(String licenseKey, String expiresAt, String refreshAfter, KeyPair signer, String unlock) throws Exception {
         String payload = "{\"format\":\"sunlicense-offline-1\",\"licenseKey\":\"" + licenseKey + "\",\"policy\":{\"name\":\"Pro\",\"expiresAt\":"
                 + (expiresAt == null ? "null" : "\"" + expiresAt + "\"") + "},\"issuedAt\":\"2026-10-01T00:00:00Z\",\"refreshAfter\":\""
-                + refreshAfter + "\"}";
+                + refreshAfter + "\"" + (unlock == null ? "" : ",\"unlock\":\"" + unlock + "\"") + "}";
         byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
         Signature s = Signature.getInstance("Ed25519");
         s.initSign(signer.getPrivate());
@@ -94,6 +99,43 @@ class LicenseGuardTest {
         assertTrue(s.allowed());
         assertEquals("{\"license\":\"" + KEY + "\",\"host\":\"paper-1234\"}", request.get());
         assertEquals("Bearer slk_test", auth.get());
+    }
+
+    @Test
+    void aValidAnswerUnlocksTheCoreAndTheNextCheckReportsIntegrity() {
+        String unlock = Base64.getEncoder().encodeToString(new byte[32]);
+        answer = "{\"valid\":true,\"status\":200,\"code\":\"VALID\",\"unlock\":\"" + unlock + "\"}";
+        LicenseGuard guard = guard(url());
+        assertEquals(State.VALID, guard.check(KEY, "paper-1").state());
+        assertTrue(guard.protection().unlocked());
+        // Kept for 7 days in the plugin's folder (encrypted), so an outage after a restart doesn't lock the core.
+        LicenseGuard restarted = guard("http://127.0.0.1:1");
+        restarted.protection().license(KEY, "paper-1");
+        assertTrue(restarted.protection().unlocked(), "cached unlock");
+
+        guard.protection().integrity(name -> null, java.util.Map.of("com/example/mymod/MyPlugin.class", "00"));
+        guard.check(KEY, "paper-1");
+        assertTrue(request.get().contains("\"integrity\":\"MODIFIED\""), request.get());
+        assertTrue(request.get().contains("\"integrityDetail\":\"1 changed: com/example/mymod/MyPlugin.class (missing)\""));
+
+        status = 400;
+        answer = "{\"valid\":false,\"status\":400,\"code\":\"SUSPENDED\"}";
+        assertEquals(State.REJECTED, guard.check(KEY, "paper-1").state());
+        assertFalse(guard.protection().unlocked(), "a rejected license gets no unlock");
+        LicenseGuard again = guard("http://127.0.0.1:1");
+        again.protection().license(KEY, "paper-1");
+        assertFalse(again.protection().unlocked(), "and the cache is gone");
+    }
+
+    @Test
+    void anOfflineFileCarriesTheUnlock() throws Exception {
+        status = 503;
+        answer = "{}";
+        offlineFile(KEY, "2027-01-01T00:00:00Z", "2026-11-01T00:00:00Z", keys,
+                Base64.getEncoder().encodeToString(new byte[32]));
+        LicenseGuard guard = guard(url());
+        assertEquals(State.VALID_OFFLINE, guard.check(KEY, "paper-1").state());
+        assertTrue(guard.protection().unlocked());
     }
 
     @Test

@@ -1,3 +1,7 @@
+/*
+ * MyMod by You. Licensed software: each server needs its own license. Terms: https://example.com/terms
+ * Licensing by SunLicense (https://sunlicense.com).
+ */
 package com.example.mymod;
 
 import java.io.IOException;
@@ -26,15 +30,19 @@ import org.slf4j.LoggerFactory;
 import com.example.mymod.license.LicenseGuard;
 import com.example.mymod.license.LicenseStatus;
 import com.example.mymod.license.Messages;
+import com.example.mymod.license.SealedCore;
+import com.example.mymod.license.SunLicenseAnalytics;
+import com.example.mymod.license.SunLicenseProtection;
 
 /**
  * A Fabric server mod protected by SunLicense. The license is checked off the server thread once the
  * server has started and every {@code recheck-hours}; your features run only while it is valid
- * ({@link #active()}, {@link #startFeatures(MinecraftServer)}).
+ * ({@link #active()}, {@link #startFeatures(MinecraftServer)}). Release builds seal the features
+ * ({@code core/CoreFeatures}), so only a valid license can run them.
  */
 public final class MyMod implements DedicatedServerModInitializer {
     public static final String MOD_ID = "mymod";
-    static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
+    public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
 
     /**
      * BuiltByBit and Voxel Shop replace this string with the buyer's license key when they download the
@@ -52,6 +60,13 @@ public final class MyMod implements DedicatedServerModInitializer {
     /** How soon to try again after no answer, in minutes. */
     private static final long RETRY_MINUTES = 10;
 
+    /** The core's entry class (sealed in release builds). */
+    private static final String CORE = "com.example.mymod.core.CoreFeatures";
+
+    /** The ownership notice logged at start-up: who makes the mod and where its terms are. */
+    private static final String AUTHOR = "You";
+    private static final String TERMS = "https://example.com/terms";
+
     private static volatile boolean active;
 
     private final ScheduledExecutorService checks = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -61,6 +76,8 @@ public final class MyMod implements DedicatedServerModInitializer {
     });
     private final Path dir = FabricLoader.getInstance().getConfigDir();
     private LicenseGuard guard;
+    private SunLicenseAnalytics analytics;
+    private Features features;
     private volatile String licenseKey;
     private String serverId;
     private volatile LicenseStatus status;
@@ -74,15 +91,26 @@ public final class MyMod implements DedicatedServerModInitializer {
 
     @Override
     public void onInitializeServer() {
+        LicenseGuard.Settings settings;
         try {
-            guard = new LicenseGuard(LicenseGuard.Settings.load(MyMod.class.getResourceAsStream("/sunlicense.properties")),
-                    dir.resolve("mymod-license.lic"));
+            settings = LicenseGuard.Settings.load(MyMod.class.getResourceAsStream("/sunlicense.properties"));
+            guard = new LicenseGuard(settings, dir.resolve("mymod-license.lic"),
+                    SunLicenseProtection.builder().product("MyMod", AUTHOR).terms(TERMS));
             serverId = serverId();
             licenseKey = LicenseGuard.pickKey(BUILT_IN_KEY, loadConfig().getProperty("license-key", ""));
         } catch (IOException e) {
             LOG.error("Can't start the license check: {}", e.getMessage());
             return;
         }
+        guard.protection().license(licenseKey, serverId);
+        LOG.info(guard.protection().notice());
+        SealedCore.checkEarly(guard.protection(), MyMod.class.getClassLoader());   // so the first check reports a modified jar
+        // Anonymous usage statistics for your Analytics tab, every 30 minutes on a background thread (config: analytics).
+        analytics = SunLicenseAnalytics.builder().baseUrl(settings.url()).apiKey(settings.apiKey())
+                .licenseKey(() -> licenseKey).fingerprint(serverId)
+                .productVersion(FabricLoader.getInstance().getModContainer(MOD_ID)
+                        .map(c -> c.getMetadata().getVersion().getFriendlyString()).orElse(null))
+                .enabled(!"false".equalsIgnoreCase(config("analytics", "true"))).start();
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> dispatcher.register(
                 Commands.literal("mymod")
                         .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
@@ -110,7 +138,10 @@ public final class MyMod implements DedicatedServerModInitializer {
                 checks.scheduleAtFixedRate(this::check, hours, hours, TimeUnit.HOURS);
             }
         });
-        ServerLifecycleEvents.SERVER_STOPPING.register(stopping -> checks.shutdownNow());
+        ServerLifecycleEvents.SERVER_STOPPING.register(stopping -> {
+            checks.shutdownNow();
+            analytics.close();
+        });
     }
 
     /** Runs on the mod's own thread; anything touching the game goes to the server thread. */
@@ -150,11 +181,25 @@ public final class MyMod implements DedicatedServerModInitializer {
     }
 
     /**
-     * Your mod's features. Fabric can't unload a mod, so register events and commands in
-     * onInitializeServer as usual and make each one return early unless {@link #active()}.
+     * Starts the core (core/CoreFeatures), once. In a release build it needs the unlock from a valid license check;
+     * without it the mod stays off and tries again with the next check.
      */
     private void startFeatures(MinecraftServer server) {
-        LOG.info("MyMod is running.");
+        if (features != null) {
+            return;
+        }
+        try {
+            features = SealedCore.load(guard.protection(), MyMod.class.getClassLoader(), CORE, Features.class);
+            features.start(server);
+        } catch (SunLicenseProtection.Locked e) {
+            active = false;
+            LOG.error("MyMod can't start yet: {} It starts as soon as SunLicense confirms the license "
+                    + "(the confirmation is kept for 7 days).", e.getMessage());
+        } catch (Exception e) {
+            active = false;
+            features = null;
+            LOG.error("MyMod's core failed to load", e);
+        }
     }
 
     private String config(String key, String fallback) {

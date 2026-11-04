@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
 
@@ -27,10 +28,17 @@ import com.example.mymod.license.LicenseStatus.State;
  *       there is one and a public key was built in; otherwise {@link State#UNREACHABLE}, and the mod
  *       decides (see {@code MyMod.ALLOW_WHEN_UNREACHABLE}).</li>
  * </ol>
+ *
+ * <p>It also feeds {@link #protection()}: a valid answer carries the core's unlock (kept and cached for 7 days on
+ * this machine, see {@link SealedCore}), a rejection forgets it, and each check sends the latest integrity result.
  */
 public final class LicenseGuard {
     /** Built into the jar from gradle.properties (sunlicense.properties). */
-    public record Settings(String url, String apiKey, String publicKey) {
+    public record Settings(String url, String apiKey, String publicKey, String product) {
+        public Settings(String url, String apiKey, String publicKey) {
+            this(url, apiKey, publicKey, "");
+        }
+
         public static Settings load(InputStream in) throws IOException {
             Properties p = new Properties();
             if (in != null) {
@@ -39,7 +47,7 @@ public final class LicenseGuard {
                 }
             }
             return new Settings(p.getProperty("url", "https://api.sunlicense.com").trim(), p.getProperty("apiKey", "").trim(),
-                    p.getProperty("publicKey", "").trim());
+                    p.getProperty("publicKey", "").trim(), p.getProperty("product", "").trim());
         }
     }
 
@@ -47,17 +55,35 @@ public final class LicenseGuard {
     private final SunLicense client;
     private final Path offlineFile;
     private final Clock clock;
+    private final SunLicenseProtection protection;
 
     public LicenseGuard(Settings settings, Path offlineFile) {
-        this(settings, offlineFile, Clock.systemUTC());
+        this(settings, offlineFile, SunLicenseProtection.builder());
+    }
+
+    /** With the ownership notice's names: {@code builder.product("MyProduct", "You").terms("https://…")}. */
+    public LicenseGuard(Settings settings, Path offlineFile, SunLicenseProtection.Builder notice) {
+        this(settings, offlineFile, Clock.systemUTC(), notice);
     }
 
     LicenseGuard(Settings settings, Path offlineFile, Clock clock) {
+        this(settings, offlineFile, clock, SunLicenseProtection.builder());
+    }
+
+    LicenseGuard(Settings settings, Path offlineFile, Clock clock, SunLicenseProtection.Builder protection) {
         this.settings = settings;
         this.offlineFile = offlineFile;
         this.clock = clock;
         this.client = new SunLicense.Builder().baseUrl(settings.url()).token(settings.apiKey())
                 .timeout(Duration.ofSeconds(10)).build();
+        // The unlock cache lives next to the offline license file.
+        this.protection = protection.clock(clock).baseUrl(settings.url()).apiKey(settings.apiKey()).productCode(settings.product())
+                .cacheDirectory(offlineFile == null ? null : offlineFile.toAbsolutePath().getParent()).build();
+    }
+
+    /** Core unlock, integrity, the ownership notice and protected files for this license. */
+    public SunLicenseProtection protection() {
+        return protection;
     }
 
     /**
@@ -88,12 +114,18 @@ public final class LicenseGuard {
                     "This build has no SunLicense API key (sunlicenseApiKey in gradle.properties); the license can't be checked.");
         }
         LicenseStatus offline = null;
+        protection.license(licenseKey, serverId);
         try {
-            SunLicense.Result r = client.validate(licenseKey.trim(), Map.of("host", serverId));
+            Map<String, String> context = new LinkedHashMap<>();
+            context.put("host", serverId);
+            context.putAll(protection.validateFields());   // integrity: OK / MODIFIED, once the core was unsealed
+            SunLicense.Result r = client.validate(licenseKey.trim(), context);
             if (r.isValid()) {
+                protection.accept(r.getBody());   // the core's unlock, when the product has a sealed core
                 return new LicenseStatus(State.VALID, "VALID", Messages.forCode("VALID"));
             }
             if (r.getStatus() == 400) {
+                protection.rejected();
                 String code = code(r.getBody());
                 return new LicenseStatus(State.REJECTED, code, Messages.forCode(code));
             }
@@ -117,6 +149,7 @@ public final class LicenseGuard {
             }
             String problem = OfflineLicense.problem(file, settings.publicKey(), licenseKey, clock.instant());
             if (problem == null) {
+                protection.acceptOffline(file, settings.publicKey());   // the file carries the core's unlock too
                 return new LicenseStatus(State.VALID_OFFLINE, "VALID", why + " Using the offline license file.");
             }
             return new LicenseStatus(State.UNREACHABLE, null, why + " The offline license file isn't usable: " + problem + ".");

@@ -67,16 +67,56 @@ Developing against your own license? Add an **exclusion** for your machine or IP
 ([blacklists and exclusions](https://docs.sunlicense.com/guide/access-rules)) so your test servers
 don't use up slots.
 
+**Usage statistics.** Every 30 minutes, in the background, the template tells SunLicense its version,
+the Minecraft/Java version, OS, architecture and CPU cores, so you see who runs what on the product's
+**Analytics** tab (with the license and machine, like bStats). No player names, IP addresses or server
+names. Buyers switch it off with `analytics=false` in `config/mymod.properties` or
+`SUNLICENSE_ANALYTICS=off`; it never affects the license check. What is sent:
+[docs](https://docs.sunlicense.com/guide/sdks#built-in-analytics).
+
+## Protection
+
+Release builds go further than a license check that an AI editor or a cracker could delete:
+
+- **Sealed core.** Everything in the `core` package (`core/CoreFeatures.java`: your features) is encrypted in the
+  release jar by `sunlicense seal`. Only a valid license check returns the key that opens it, so a copy whose check
+  was cut out has nothing to run. The key from the last valid check is kept for 7 days, encrypted for this
+  server (a `.sunlicense-unlock-…` file next to `config/mymod-license.lic`), and an offline license file carries it too, so
+  an outage doesn't stop your customers. A suspended, expired or revoked license gets no key.
+- **Tamper reports.** The seal carries the SHA-256 of your other classes. A modified jar still starts, but says so
+  in its next license check, and [Sentinel](https://docs.sunlicense.com/guide/sentinel) suggests suspending that license.
+- **Ownership notice.** The header comment in `MyMod.java` and one start-up line
+  (`MyMod is licensed software by You. License AX8P-XXXX-XXXX-XXXX. Terms: …`): set `AUTHOR` and `TERMS`.
+
+Build a release with the [SunLicense CLI](https://docs.sunlicense.com/cli/) signed in (or `SUNLICENSE_TOKEN` set):
+
+```bash
+./gradlew build -PsunlicenseProduct=<your product code>
+```
+
+Ship `build/release/<jar>`. Without the property, `./gradlew build` is a development build with the core in
+plain: test with it, don't sell it. In GitHub Actions, add the secret `SUNLICENSE_TOKEN` (a personal access
+token) and the variable `SUNLICENSE_PRODUCT`, and the workflow builds the release jar. Code the platform loads by
+name (the main class, mixins and the fabric.mod.json entrypoint) stays outside `core`.
+
+Honest limit: someone with a valid license can still pull the key out of memory and patch their copy; that copy
+then reports itself as modified. [How protection works](https://docs.sunlicense.com/guide/protection).
+
 ## Files
 
 ```
 build.gradle, gradle.properties           Loom, Minecraft, Fabric API, SDK, settings baked into the jar
 src/main/java/.../MyMod.java              start-up, re-checks, /mymod, active(), your features
+src/main/java/.../core/CoreFeatures.java    your features: the core, sealed in release builds
+src/main/java/.../license/SealedCore.java  loads the core (sealed or plain) and checks the jar
+src/main/java/.../license/SunLicenseProtection.java unlock, cache, integrity, notice (a copy of the SDK's; replace, don't edit)
 src/main/java/.../license/LicenseGuard.java   online check → offline file → status (no Minecraft code, tested)
 src/main/java/.../license/OfflineLicense.java Ed25519 offline license file check
 src/main/java/.../license/Messages.java   what the server owner reads
-src/main/resources/mymod.properties       license-key, recheck-hours (copied to config/ on first start)
+src/main/java/.../license/SunLicenseAnalytics.java anonymous usage statistics (a copy of the SDK's; replace, don't edit)
+src/main/resources/mymod.properties       license-key, recheck-hours, analytics (copied to config/ on first start)
 src/test/java/.../LicenseGuardTest.java   every result against a stub SunLicense
+src/test/java/.../SealedCoreTest.java     the sealed core opens only with a valid unlock
 .github/workflows/build.yml               CI
 ```
 

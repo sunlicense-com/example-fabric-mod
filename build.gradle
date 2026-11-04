@@ -2,6 +2,10 @@ plugins {
 	id 'net.fabricmc.fabric-loom' version "${loom_version}"
 }
 
+// Your product's code in SunLicense. Set it (-PsunlicenseProduct=… or ORG_GRADLE_PROJECT_sunlicenseProduct) for
+// release builds: see "Core unlock" at the end of this file.
+def sunlicenseProduct = (project.findProperty("sunlicenseProduct") ?: "").toString().trim()
+
 repositories {
 	mavenCentral()
 }
@@ -28,6 +32,7 @@ processResources {
 		sunlicenseUrl      : (project.findProperty("sunlicenseUrl") ?: "https://api.sunlicense.com").toString(),
 		sunlicenseApiKey   : (project.findProperty("sunlicenseApiKey") ?: "").toString(),
 		sunlicensePublicKey: (project.findProperty("sunlicensePublicKey") ?: "").toString(),
+		sunlicenseProduct  : sunlicenseProduct,
 	]
 	inputs.properties(values)
 	filesMatching(["fabric.mod.json", "sunlicense.properties"]) {
@@ -46,4 +51,78 @@ java {
 
 test {
 	useJUnitPlatform()
+}
+
+// ---- Core unlock and tamper reports (https://docs.sunlicense.com/guide/protection) ----
+// With -PsunlicenseProduct=<product code> and the SunLicense CLI signed in (or SUNLICENSE_TOKEN set),
+// `./gradlew build` also writes build/release/<jar>: the same mod, but the core package is encrypted with
+// `sunlicense seal` (only a valid license check unlocks it) and carries the SHA-256 of your other classes, so a
+// modified copy is reported. Ship that jar. Without the property, build/libs has a development build with the core
+// in plain. Rename both packages here if you rename yours.
+def corePackage = "com/example/mymod/core/"
+def ownPackage = "com/example/mymod/"
+def sealDir = layout.buildDirectory.dir("sunlicense")
+
+def unpackJar = tasks.register("unpackJar", Sync) {
+	from(zipTree(tasks.named("jar").flatMap { it.archiveFile }))
+	into(sealDir.map { it.dir("unpacked") })
+}
+
+// The release jar's content without the core.
+def plainClasses = tasks.register("plainClasses", Sync) {
+	from(unpackJar) { exclude("${corePackage}**") }
+	into(sealDir.map { it.dir("plain") })
+}
+
+// The classes whose digests go into the seal: your own, as they are in the final jar.
+def digestClasses = tasks.register("digestClasses", Sync) {
+	from(plainClasses) { include("${ownPackage}**/*.class") }
+	into(sealDir.map { it.dir("digest") })
+}
+
+def coreJar = tasks.register("coreJar", Zip) {
+	from(unpackJar) { include("${corePackage}**") }
+	destinationDirectory = sealDir
+	archiveFileName = "core.jar"
+}
+
+def sealCore = tasks.register("sealCore", Exec) {
+	dependsOn(digestClasses, coreJar)
+	def product = sunlicenseProduct
+	def cli = (project.findProperty("sunlicenseCli") ?: "sunlicense").toString()   // or a full path to the CLI
+	def digest = sealDir.get().dir("digest").asFile
+	def core = sealDir.get().file("core.jar").asFile
+	def sealed = sealDir.get().file("core.sealed").asFile
+	inputs.dir(digest)
+	inputs.file(core)
+	outputs.file(sealed)
+	// Run from the digest folder, so each digest is named like the class's entry in the jar.
+	workingDir(digest)
+	commandLine(cli, "seal", core.absolutePath, "--product", product, "--digest", "**/*.class")
+	doFirst {
+		if (product.isEmpty()) {
+			throw new GradleException("Set -PsunlicenseProduct=<your product code> to seal the core")
+		}
+		standardOutput = new FileOutputStream(sealed)
+	}
+	doLast {
+		standardOutput.close()
+		if (!sealed.text.trim().startsWith("SLS1.")) {
+			throw new GradleException("`sunlicense seal` didn't print sealed data; run it by hand to see why")
+		}
+	}
+}
+
+def releaseJar = tasks.register("releaseJar", Zip) {
+	dependsOn(sealCore, plainClasses)
+	def plain = sealDir.map { it.dir("plain") }
+	from(plain) { include("META-INF/MANIFEST.MF") }   // first, like a normal jar
+	from(plain) { exclude("META-INF/MANIFEST.MF") }
+	from(sealDir.map { it.file("core.sealed") }) { into("sunlicense") }
+	destinationDirectory = layout.buildDirectory.dir("release")
+	archiveFileName = tasks.named("jar").flatMap { it.archiveFileName }
+}
+
+if (!sunlicenseProduct.isEmpty()) {
+	tasks.named("build") { dependsOn(releaseJar) }
 }
